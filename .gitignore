@@ -1,0 +1,9 @@
+venv/
+data/
+uploads/
+__pycache__/
+*.pyc
+*.pyo
+.streamlit/
+*.db
+*.sqlite
