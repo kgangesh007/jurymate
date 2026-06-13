@@ -4,7 +4,7 @@ import ollama
 from core.ingestion import retrieve_context
 
 # Change to "llama3" on AMD Developer Cloud
-MODEL = "llama3.2:3b"
+MODEL = "deepseek-r1:70b"
 
 # ── LLM helper ─────────────────────────────────────────────
 def _llm(system: str, user: str) -> str:

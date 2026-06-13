@@ -26,7 +26,7 @@ def get_collection():
         os.makedirs(CHROMA_PATH, exist_ok=True)
         _chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
         ef = SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
+            model_name="all-mpnet-base-v2"
         )
         _collection = _chroma_client.get_or_create_collection(
             name=COLLECTION_NAME,
@@ -41,7 +41,7 @@ def _is_llava_available() -> bool:
     try:
         models = ollama.list()
         return any(
-            "llava" in m["name"].lower()
+            "llama3.2-vision" in m["name"].lower()
             for m in models.get("models", [])
         )
     except Exception:
@@ -58,7 +58,7 @@ def _describe_image_with_llava(img: Image.Image, slide_num: int) -> str:
     try:
         img_b64 = _image_to_base64(img)
         resp = ollama.chat(
-            model="llava",
+            model="llama3.2-vision:11b",
             messages=[{
                 "role": "user",
                 "content": f"""This is slide {slide_num} from a hackathon project presentation.
