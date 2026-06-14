@@ -210,3 +210,14 @@ def clear_chat_history(team_name: str):
     )
     conn.commit()
     conn.close()
+
+# ── Delete Team ────────────────────────────────────────────
+def delete_team(team_name: str):
+    """Delete team and all related data from SQLite"""
+    conn = get_connection()
+    conn.execute("DELETE FROM chat_history WHERE team_name = ?", (team_name,))
+    conn.execute("DELETE FROM scores WHERE team_name = ?", (team_name,))
+    conn.execute("DELETE FROM documents WHERE team_name = ?", (team_name,))
+    conn.execute("DELETE FROM teams WHERE team_name = ?", (team_name,))
+    conn.commit()
+    conn.close()

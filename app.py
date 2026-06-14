@@ -2,13 +2,14 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-import os, time
+import os
 
-from core.database   import (
+from core.database import (
     init_db, get_all_teams, get_documents, get_chat_history,
-    save_message, get_score, get_all_scores, save_score, clear_chat_history
+    save_message, get_score, get_all_scores, save_score,
+    clear_chat_history, delete_team
 )
-from core.ingestion  import ingest_document
+from core.ingestion import ingest_document, delete_team_documents
 from agents.jury_agents import (
     score_submission, chat_with_team,
     chat_with_all, compare_teams, generate_feedback
@@ -22,169 +23,118 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ── Init ───────────────────────────────────────────────────
 init_db()
 
-# ── Custom CSS ─────────────────────────────────────────────
+# ── CSS ────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* ── Base ── */
-[data-testid="stAppViewContainer"] {
-    background: #0f1117;
-    color: #e8e8f0;
-}
-[data-testid="stSidebar"] {
-    background: #16181f;
-    border-right: 1px solid #2a2d3a;
-}
-
-/* ── Sidebar header ── */
+[data-testid="stAppViewContainer"] { background: #0f1117; color: #e8e8f0; }
+[data-testid="stSidebar"] { background: #16181f; border-right: 1px solid #2a2d3a; }
 .jury-logo {
-    font-size: 1.4rem;
-    font-weight: 700;
-    letter-spacing: -0.5px;
-    color: #ffffff;
-    padding: 0.5rem 0 1.2rem 0;
-    border-bottom: 1px solid #2a2d3a;
-    margin-bottom: 1rem;
+    font-size: 1.4rem; font-weight: 700; letter-spacing: -0.5px;
+    color: #ffffff; padding: 0.5rem 0 1.2rem 0;
+    border-bottom: 1px solid #2a2d3a; margin-bottom: 1rem;
 }
 .jury-logo span { color: #7c6af5; }
-
-/* ── Sidebar nav items ── */
-.nav-item {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    padding: 0.55rem 0.8rem;
-    border-radius: 8px;
-    cursor: pointer;
-    font-size: 0.88rem;
-    color: #9a9bb0;
-    margin-bottom: 2px;
-    transition: background 0.15s;
-}
-.nav-item:hover  { background: #1e2030; color: #e8e8f0; }
-.nav-item.active { background: #1e2030; color: #ffffff; font-weight: 600; }
-.nav-item .dot   { width: 8px; height: 8px; border-radius: 50%;
-                   background: #7c6af5; flex-shrink: 0; }
-
-/* ── Status badges ── */
-.badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 20px;
-    font-size: 0.75rem;
-    font-weight: 600;
-}
-.badge-indexed    { background: #1a3a2a; color: #4ade80; }
-.badge-processing { background: #2a2a1a; color: #fbbf24; }
-.badge-pending    { background: #1a1a2a; color: #818cf8; }
-.badge-failed     { background: #3a1a1a; color: #f87171; }
-
-/* ── Chat bubbles ── */
 .chat-user {
-    background: #7c6af5;
-    color: #fff;
-    padding: 0.75rem 1rem;
-    border-radius: 18px 18px 4px 18px;
-    margin: 0.4rem 0 0.4rem 20%;
-    font-size: 0.9rem;
-    line-height: 1.5;
+    background: #7c6af5; color: #fff;
+    padding: 0.75rem 1rem; border-radius: 18px 18px 4px 18px;
+    margin: 0.4rem 0 0.4rem 20%; font-size: 0.9rem; line-height: 1.5;
 }
 .chat-assistant {
-    background: #1e2030;
-    color: #e8e8f0;
-    padding: 0.75rem 1rem;
-    border-radius: 18px 18px 18px 4px;
-    margin: 0.4rem 20% 0.4rem 0;
-    font-size: 0.9rem;
-    line-height: 1.6;
-    border: 1px solid #2a2d3a;
+    background: #1e2030; color: #e8e8f0;
+    padding: 0.75rem 1rem; border-radius: 18px 18px 18px 4px;
+    margin: 0.4rem 20% 0.4rem 0; font-size: 0.9rem;
+    line-height: 1.6; border: 1px solid #2a2d3a;
 }
-.citation-block {
-    margin-top: 0.5rem;
-    padding: 0.4rem 0.7rem;
-    background: #12141c;
-    border-left: 3px solid #7c6af5;
-    border-radius: 0 6px 6px 0;
-    font-size: 0.78rem;
-    color: #7c6af5;
-}
-
-/* ── Score card ── */
-.score-card {
-    background: #1e2030;
-    border: 1px solid #2a2d3a;
-    border-radius: 12px;
-    padding: 1rem 1.2rem;
-    margin-bottom: 0.7rem;
-}
-.score-total {
-    font-size: 2.5rem;
-    font-weight: 800;
-    color: #7c6af5;
-    line-height: 1;
-}
-.score-label { font-size: 0.78rem; color: #9a9bb0; margin-top: 2px; }
-.score-row   { display: flex; justify-content: space-between;
-               align-items: center; padding: 0.3rem 0;
-               border-bottom: 1px solid #2a2d3a; font-size: 0.85rem; }
-.score-row:last-child { border-bottom: none; }
-
-/* ── Upload area ── */
 .upload-hint {
-    text-align: center;
-    color: #9a9bb0;
-    font-size: 0.85rem;
-    padding: 1rem;
-    border: 1px dashed #2a2d3a;
-    border-radius: 10px;
-    margin-bottom: 1rem;
+    text-align: center; color: #9a9bb0; font-size: 0.85rem;
+    padding: 1rem; border: 1px dashed #2a2d3a;
+    border-radius: 10px; margin-bottom: 1rem;
 }
-
-/* ── Metric tiles ── */
 .metric-tile {
-    background: #1e2030;
-    border: 1px solid #2a2d3a;
-    border-radius: 10px;
-    padding: 1rem;
-    text-align: center;
+    background: #1e2030; border: 1px solid #2a2d3a;
+    border-radius: 10px; padding: 1rem; text-align: center;
 }
 .metric-value { font-size: 1.8rem; font-weight: 700; color: #7c6af5; }
 .metric-label { font-size: 0.78rem; color: #9a9bb0; margin-top: 2px; }
-
-/* ── Streamlit overrides ── */
 .stButton > button {
-    background: #7c6af5;
-    color: #fff;
-    border: none;
-    border-radius: 8px;
-    font-weight: 600;
-    padding: 0.4rem 1rem;
+    background: #7c6af5; color: #fff; border: none;
+    border-radius: 8px; font-weight: 600; padding: 0.4rem 1rem;
 }
 .stButton > button:hover { background: #6a58e0; }
+.delete-btn > button {
+    background: #3a1a1a !important; color: #f87171 !important;
+}
 div[data-testid="stChatInput"] > div {
-    border: 1px solid #2a2d3a;
-    background: #1e2030;
-    border-radius: 12px;
+    border: 1px solid #2a2d3a; background: #1e2030; border-radius: 12px;
+}
+.section-label {
+    font-size: 0.75rem; color: #9a9bb0; padding: 0.5rem 0 0.3rem;
+    text-transform: uppercase; letter-spacing: 0.08em;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session state defaults ─────────────────────────────────
+# ── Session state ──────────────────────────────────────────
 if "active_view" not in st.session_state:
     st.session_state.active_view = "all_teams"
-if "compare_a" not in st.session_state:
-    st.session_state.compare_a = None
-if "compare_b" not in st.session_state:
-    st.session_state.compare_b = None
+if "confirm_delete" not in st.session_state:
+    st.session_state.confirm_delete = None
 
-# ── Sidebar ────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────
+def render_chat(chat_key: str, is_all_teams: bool = False,
+                team_name: str = None):
+    history = get_chat_history(chat_key)
+
+    if not history:
+        st.markdown(
+            '<div class="upload-hint">'
+            + ("Ask anything across all team submissions — who used what, how they built it, which is best."
+               if is_all_teams else
+               f"Ask anything about this submission.")
+            + "</div>",
+            unsafe_allow_html=True
+        )
+    for msg in history:
+        if msg["role"] == "user":
+            st.markdown(
+                f'<div class="chat-user">{msg["message"]}</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                f'<div class="chat-assistant">{msg["message"]}</div>',
+                unsafe_allow_html=True
+            )
+
+    placeholder = ("Ask about all teams — who used RAG? which team had best innovation?…"
+                   if is_all_teams else
+                   f"Ask about this submission…")
+    question = st.chat_input(placeholder)
+
+    if question:
+        save_message(chat_key, "user", question)
+        with st.spinner("Thinking…"):
+            if is_all_teams:
+                result = chat_with_all(question, history)
+            else:
+                result = chat_with_team(team_name, question, history)
+
+        answer = result["answer"]
+        if result.get("citations"):
+            cite_text = "\n".join(f"📌 {c}" for c in result["citations"])
+            answer += f"\n\n---\n**Sources:**\n{cite_text}"
+
+        save_message(chat_key, "assistant", answer)
+        st.rerun()
+
+# ── SIDEBAR ────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="jury-logo">⚖️ Jury<span>Mate</span></div>',
                 unsafe_allow_html=True)
 
-    # Upload section
+    # Upload
     with st.expander("➕ Add Submission", expanded=False):
         team_input = st.text_input("Team name", placeholder="e.g. Team Alpha")
         uploaded   = st.file_uploader(
@@ -210,29 +160,24 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # All teams chat
+    # All Teams Chat
     is_all = st.session_state.active_view == "all_teams"
     if st.button(
-        f"{'●' if is_all else '○'}  💬 All Teams",
-        use_container_width=True,
-        key="nav_all"
+        f"{'●' if is_all else '○'}  💬 All Teams Chat",
+        use_container_width=True, key="nav_all"
     ):
         st.session_state.active_view = "all_teams"
         st.rerun()
 
-    # Per-team chats
+    # Per-team list
     teams = get_all_teams()
     if teams:
-        st.markdown(
-            "<div style='font-size:0.75rem;color:#9a9bb0;"
-            "padding:0.5rem 0 0.3rem;text-transform:uppercase;"
-            "letter-spacing:0.08em'>Submissions</div>",
-            unsafe_allow_html=True
-        )
+        st.markdown('<div class="section-label">Submissions</div>',
+                    unsafe_allow_html=True)
         for t in teams:
-            name    = t["team_name"]
+            name      = t["team_name"]
             is_active = st.session_state.active_view == name
-            label   = f"{'●' if is_active else '○'}  📁 {name.replace('_',' ').title()}"
+            label     = f"{'●' if is_active else '○'}  📁 {name.replace('_',' ').title()}"
             if st.button(label, use_container_width=True, key=f"nav_{name}"):
                 st.session_state.active_view = name
                 st.rerun()
@@ -240,81 +185,30 @@ with st.sidebar:
     st.markdown("---")
 
     # Tools
-    st.markdown(
-        "<div style='font-size:0.75rem;color:#9a9bb0;"
-        "padding:0 0 0.3rem;text-transform:uppercase;"
-        "letter-spacing:0.08em'>Tools</div>",
-        unsafe_allow_html=True
-    )
-    if st.button("🏆  Leaderboard", use_container_width=True, key="nav_lb"):
-        st.session_state.active_view = "leaderboard"
-        st.rerun()
-    if st.button("⚖️  Compare Teams", use_container_width=True, key="nav_cmp"):
-        st.session_state.active_view = "compare"
-        st.rerun()
-    if st.button("📋  Registry", use_container_width=True, key="nav_reg"):
-        st.session_state.active_view = "registry"
-        st.rerun()
+    st.markdown('<div class="section-label">Tools</div>',
+                unsafe_allow_html=True)
+    for label, view_key, icon in [
+        ("Leaderboard",   "leaderboard", "🏆"),
+        ("Compare Teams", "compare",     "⚖️"),
+        ("Registry",      "registry",    "📋"),
+    ]:
+        is_active = st.session_state.active_view == view_key
+        if st.button(
+            f"{'●' if is_active else '○'}  {icon} {label}",
+            use_container_width=True, key=f"nav_{view_key}"
+        ):
+            st.session_state.active_view = view_key
+            st.rerun()
 
 # ══════════════════════════════════════════════════════════
-# ── VIEWS ─────────────────────────────────────────────────
+# VIEWS
 # ══════════════════════════════════════════════════════════
-
 view = st.session_state.active_view
-
-# ── Helper: render chat window ─────────────────────────────
-def render_chat(team_name: str, is_all_teams: bool = False):
-    history = get_chat_history(team_name)
-
-    chat_area = st.container()
-    with chat_area:
-        if not history:
-            st.markdown(
-                '<div class="upload-hint">'
-                + ("Ask anything across all team submissions."
-                   if is_all_teams else
-                   f"Ask anything about **{team_name.replace('_',' ').title()}**'s submission.")
-                + "</div>",
-                unsafe_allow_html=True
-            )
-        for msg in history:
-            if msg["role"] == "user":
-                st.markdown(
-                    f'<div class="chat-user">{msg["message"]}</div>',
-                    unsafe_allow_html=True
-                )
-            else:
-                st.markdown(
-                    f'<div class="chat-assistant">{msg["message"]}</div>',
-                    unsafe_allow_html=True
-                )
-
-    # Input
-    placeholder = ("Ask about all teams…"
-                   if is_all_teams else
-                   f"Ask about {team_name.replace('_',' ').title()}…")
-    question = st.chat_input(placeholder)
-
-    if question:
-        save_message(team_name, "user", question)
-        with st.spinner("Thinking…"):
-            if is_all_teams:
-                result = chat_with_all(question, history)
-            else:
-                result = chat_with_team(team_name, question, history)
-
-        answer = result["answer"]
-        if result.get("citations"):
-            cite_text = "\n".join(f"📌 {c}" for c in result["citations"])
-            answer += f"\n\n---\n**Sources:**\n{cite_text}"
-
-        save_message(team_name, "assistant", answer)
-        st.rerun()
 
 # ── VIEW: All Teams Chat ───────────────────────────────────
 if view == "all_teams":
-    st.markdown("## 💬 All Teams")
-    st.caption("Search and query across every submission at once")
+    st.markdown("## 💬 All Teams Chat")
+    st.caption("Chat across every submission — ask who used what technology, compare approaches, find the best solutions")
     render_chat("__all_teams__", is_all_teams=True)
 
 # ── VIEW: Individual Team ──────────────────────────────────
@@ -324,10 +218,11 @@ elif view in [t["team_name"] for t in get_all_teams()]:
     docs         = get_documents(team_name)
     existing_score = get_score(team_name)
 
-    col_title, col_score_btn, col_clear = st.columns([4, 1.5, 1])
+    # Header row
+    col_title, col_score, col_clear, col_delete = st.columns([3.5, 1.5, 0.8, 0.8])
     with col_title:
         st.markdown(f"## 📁 {display_name}")
-    with col_score_btn:
+    with col_score:
         if st.button("⭐ Score This Team", use_container_width=True):
             with st.spinner("Scoring submission…"):
                 result = score_submission(team_name)
@@ -343,10 +238,9 @@ elif view in [t["team_name"] for t in get_all_teams()]:
                 reasoning = {
                     k: result[k].get("reason", "")
                     for k in ["problem","technical","future_work",
-                               "innovation","presentation"]
+                              "innovation","presentation"]
                 }
                 save_score(team_name, scores, reasoning)
-                st.session_state[f"score_{team_name}"] = result
                 st.rerun()
             else:
                 st.error(result["error"])
@@ -354,9 +248,24 @@ elif view in [t["team_name"] for t in get_all_teams()]:
         if st.button("🗑️ Clear", use_container_width=True):
             clear_chat_history(team_name)
             st.rerun()
+    with col_delete:
+        if st.session_state.confirm_delete == team_name:
+            if st.button("✅ Confirm", use_container_width=True):
+                delete_team_documents(team_name)
+                delete_team(team_name)
+                st.session_state.active_view = "all_teams"
+                st.session_state.confirm_delete = None
+                st.rerun()
+        else:
+            if st.button("❌ Delete", use_container_width=True):
+                st.session_state.confirm_delete = team_name
+                st.rerun()
 
-    # Show score if exists
-    score_data = existing_score
+    # Confirm delete warning
+    if st.session_state.confirm_delete == team_name:
+        st.warning(f"⚠️ Are you sure you want to delete **{display_name}** and all their data? Click Confirm to proceed.")
+
+    # Score breakdown
     if existing_score:
         with st.expander("📊 Score Breakdown", expanded=False):
             c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -369,7 +278,6 @@ elif view in [t["team_name"] for t in get_all_teams()]:
                 (c6, "Problem",      existing_score["problem"],       10),
             ]
             for col, label, val, max_val in tiles:
-                pct = int((val / max_val) * 100) if max_val else 0
                 with col:
                     st.markdown(
                         f'<div class="metric-tile">'
@@ -379,23 +287,22 @@ elif view in [t["team_name"] for t in get_all_teams()]:
                         unsafe_allow_html=True
                     )
 
-    # Docs status strip
+    # Doc status
     if docs:
         status_map = {"indexed":"🟢","processing":"🟡","pending":"🔵","failed":"🔴"}
-        doc_pills = " &nbsp; ".join(
-            f"{status_map.get(d['status'],'⚪')} {d['filename']}"
-            for d in docs
+        pills = " &nbsp; ".join(
+            f"{status_map.get(d['status'],'⚪')} {d['filename']}" for d in docs
         )
-        st.caption(doc_pills, unsafe_allow_html=True)
+        st.caption(pills, unsafe_allow_html=True)
 
     st.markdown("---")
-    render_chat(team_name)
+    render_chat(team_name, team_name=team_name)
 
 # ── VIEW: Leaderboard ──────────────────────────────────────
 elif view == "leaderboard":
     st.markdown("## 🏆 Leaderboard")
-    scores = get_all_scores()
 
+    scores = get_all_scores()
     if not scores:
         st.info("No scores yet. Open a team and click ⭐ Score This Team.")
     else:
@@ -404,7 +311,6 @@ elif view == "leaderboard":
         df = df.sort_values("total", ascending=False).reset_index(drop=True)
         df.index += 1
 
-        # Bar chart
         fig = px.bar(
             df, x="team_name", y="total",
             color="total",
@@ -413,17 +319,13 @@ elif view == "leaderboard":
             text="total"
         )
         fig.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font_color="#e8e8f0",
-            showlegend=False,
-            coloraxis_showscale=False,
-            margin=dict(t=20,b=20)
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#e8e8f0", showlegend=False,
+            coloraxis_showscale=False, margin=dict(t=20,b=20)
         )
         fig.update_traces(texttemplate="%{text:.0f}", textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
 
-        # Table
         display_cols = {
             "team_name":   "Team",
             "total":       "Total /100",
@@ -435,9 +337,14 @@ elif view == "leaderboard":
         }
         st.dataframe(
             df[list(display_cols.keys())].rename(columns=display_cols),
-            use_container_width=True,
-            hide_index=False
+            use_container_width=True
         )
+
+    # Chat below leaderboard
+    st.markdown("---")
+    st.markdown("### 💬 Ask About the Leaderboard")
+    st.caption("Ask questions like: Which team scored highest on innovation? Who had best technical implementation?")
+    render_chat("__leaderboard_chat__", is_all_teams=True)
 
 # ── VIEW: Compare ──────────────────────────────────────────
 elif view == "compare":
@@ -466,22 +373,19 @@ elif view == "compare":
         if st.button("⚖️ Run Comparison", use_container_width=False):
             with st.spinner("Comparing submissions…"):
                 result = compare_teams(team_a, team_b)
-
             st.markdown("### Analysis")
             st.markdown(result["answer"])
-
             if result.get("citations"):
                 with st.expander("📌 Sources"):
                     for c in result["citations"]:
                         st.caption(c)
 
-        # Side-by-side scores
+        # Score comparison chart
         score_a = get_score(team_a)
         score_b = get_score(team_b)
         if score_a and score_b:
             st.markdown("### Score Comparison")
-            criteria = ["problem","technical","future_work",
-                        "innovation","presentation"]
+            criteria = ["problem","technical","future_work","innovation","presentation"]
             fig = go.Figure()
             fig.add_trace(go.Bar(
                 name=team_a.replace("_"," ").title(),
@@ -502,6 +406,12 @@ elif view == "compare":
             )
             st.plotly_chart(fig, use_container_width=True)
 
+    # Chat below compare
+    st.markdown("---")
+    st.markdown("### 💬 Ask About These Teams")
+    st.caption("Ask questions across all submissions — who used better technology? which team solved the bigger problem?")
+    render_chat("__compare_chat__", is_all_teams=True)
+
 # ── VIEW: Registry ─────────────────────────────────────────
 elif view == "registry":
     st.markdown("## 📋 Document Registry")
@@ -516,25 +426,22 @@ elif view == "registry":
             "pending":    "🔵 Pending",
             "failed":     "❌ Failed"
         }
-
         rows = []
         for d in docs:
             rows.append({
-                "Team":        d["team_name"].replace("_"," ").title(),
-                "File":        d["filename"],
-                "Type":        d["file_type"].upper() if d["file_type"] else "-",
-                "Size (KB)":   d["file_size_kb"] or "-",
-                "Pages":       d["total_pages"] or "-",
-                "Chunks":      d["total_chunks"] or "-",
-                "Status":      status_emoji.get(d["status"], d["status"]),
-                "Uploaded":    d["upload_time"][:16] if d["upload_time"] else "-",
-                "Error":       d["error_message"] or ""
+                "Team":      d["team_name"].replace("_"," ").title(),
+                "File":      d["filename"],
+                "Type":      d["file_type"].upper() if d["file_type"] else "-",
+                "Size (KB)": d["file_size_kb"] or "-",
+                "Pages":     d["total_pages"] or "-",
+                "Chunks":    d["total_chunks"] or "-",
+                "Status":    status_emoji.get(d["status"], d["status"]),
+                "Uploaded":  d["upload_time"][:16] if d["upload_time"] else "-",
+                "Error":     d["error_message"] or ""
             })
 
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-        # Summary metrics
         st.markdown("---")
         m1, m2, m3, m4 = st.columns(4)
         total_docs   = len(docs)
