@@ -1,33 +1,32 @@
 import os
 import io
+import re
 import base64
+import zipfile
 import fitz                        # PyMuPDF
 from pptx import Presentation
-from pptx.util import Inches
 from PIL import Image, ImageDraw
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 import ollama
 from core.database import (
     register_document, update_document_status, add_team
 )
 
-CHROMA_PATH = os.path.join(os.path.dirname(__file__), "../data/chroma")
+CHROMA_PATH     = os.path.join(os.path.dirname(__file__), "../data/chroma")
 COLLECTION_NAME = "jurymate"
 
 # ── ChromaDB setup ─────────────────────────────────────────
 _chroma_client = None
-_collection     = None
+_collection    = None
 
 def get_collection():
     global _chroma_client, _collection
     if _collection is None:
         os.makedirs(CHROMA_PATH, exist_ok=True)
         _chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-        ef = SentenceTransformerEmbeddingFunction(
-            model_name="all-mpnet-base-v2"
-        )
+        ef = DefaultEmbeddingFunction()
         _collection = _chroma_client.get_or_create_collection(
             name=COLLECTION_NAME,
             embedding_function=ef,
@@ -36,8 +35,7 @@ def get_collection():
     return _collection
 
 # ── Vision helpers ─────────────────────────────────────────
-def _is_llava_available() -> bool:
-    """Check if LLaVA model is available in Ollama"""
+def _is_vision_available() -> bool:
     try:
         models = ollama.list()
         return any(
@@ -48,13 +46,11 @@ def _is_llava_available() -> bool:
         return False
 
 def _image_to_base64(img: Image.Image) -> str:
-    """Convert PIL image to base64 string"""
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-def _describe_image_with_llava(img: Image.Image, slide_num: int) -> str:
-    """Send slide image to LLaVA and get full description"""
+def _describe_slide_image(img: Image.Image, slide_num: int) -> str:
     try:
         img_b64 = _image_to_base64(img)
         resp = ollama.chat(
@@ -62,14 +58,14 @@ def _describe_image_with_llava(img: Image.Image, slide_num: int) -> str:
             messages=[{
                 "role": "user",
                 "content": f"""This is slide {slide_num} from a hackathon project presentation.
-Please describe everything visible in detail including:
-- All text visible on the slide
+Describe everything visible in detail:
+- All text on the slide
 - Architecture diagrams and their components
-- Technology names, tools, frameworks mentioned
+- Technology names, tools, frameworks
 - Flow diagrams and what they represent
-- Any metrics, accuracy numbers, or results shown
-- Any dataset names or model names visible
-Be thorough and specific. Extract maximum information.""",
+- Any metrics, accuracy numbers, results
+- Dataset names or model names
+Be thorough and specific.""",
                 "images": [img_b64]
             }]
         )
@@ -78,95 +74,211 @@ Be thorough and specific. Extract maximum information.""",
         return f"[Vision analysis unavailable: {str(e)}]"
 
 def _slide_to_pil_image(slide, width=1280, height=720) -> Image.Image:
-    """
-    Convert a PPTX slide to PIL Image.
-    Renders text content visually so LLaVA can read it.
-    """
     img  = Image.new("RGB", (width, height), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
-
     y_pos = 30
     for shape in slide.shapes:
-        # Extract text from text frames
         if hasattr(shape, "text_frame"):
             for para in shape.text_frame.paragraphs:
                 text = para.text.strip()
                 if text:
-                    # Wrap long text
-                    words  = text.split()
-                    line   = ""
+                    words, line = text.split(), ""
                     for word in words:
                         if len(line + word) < 90:
                             line += word + " "
                         else:
-                            draw.text((30, y_pos), line.strip(),
-                                      fill=(0, 0, 0))
+                            draw.text((30, y_pos), line.strip(), fill=(0,0,0))
                             y_pos += 22
-                            line   = word + " "
+                            line = word + " "
                     if line.strip():
-                        draw.text((30, y_pos), line.strip(),
-                                  fill=(0, 0, 0))
+                        draw.text((30, y_pos), line.strip(), fill=(0,0,0))
                         y_pos += 22
                     y_pos += 8
-
-        # Extract images from picture shapes
-        if shape.shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
+        if shape.shape_type == 13:
             try:
-                img_bytes = shape.image.blob
-                pic       = Image.open(io.BytesIO(img_bytes))
-                # Resize to fit remaining space
-                max_w = width - 60
-                max_h = max(100, height - y_pos - 30)
-                pic.thumbnail((max_w, max_h), Image.LANCZOS)
+                pic = Image.open(io.BytesIO(shape.image.blob))
+                pic.thumbnail((width-60, max(100, height-y_pos-30)), Image.LANCZOS)
                 img.paste(pic, (30, y_pos))
                 y_pos += pic.height + 15
             except Exception:
                 pass
-
         if y_pos > height - 30:
             break
-
     return img
 
 def _slide_has_images(slide) -> bool:
-    """Check if slide contains picture shapes"""
     return any(shape.shape_type == 13 for shape in slide.shapes)
 
 def _slide_text_is_thin(slide, threshold=80) -> bool:
-    """Check if slide has very little extractable text"""
     text = " ".join(
         shape.text for shape in slide.shapes
         if hasattr(shape, "text")
     ).strip()
     return len(text) < threshold
 
+# ── Code helpers ───────────────────────────────────────────
+# Supported code file extensions
+CODE_EXTENSIONS = {
+    ".py":   "python",
+    ".js":   "javascript",
+    ".ts":   "typescript",
+    ".java": "java",
+    ".go":   "go",
+    ".rs":   "rust",
+    ".cpp":  "cpp",
+    ".c":    "c",
+    ".sh":   "bash",
+    ".sql":  "sql",
+    ".yaml": "yaml",
+    ".yml":  "yaml",
+    ".json": "json",
+    ".md":   "markdown",
+    ".txt":  "text",
+    ".html": "html",
+    ".css":  "css",
+}
+
+SKIP_DIRS = {
+    "__pycache__", ".git", "node_modules", "venv", ".venv",
+    "env", "dist", "build", ".idea", ".vscode"
+}
+
+def _get_file_language(filename: str) -> str:
+    ext = os.path.splitext(filename)[1].lower()
+    return CODE_EXTENSIONS.get(ext, "")
+
+def _extract_code_structure(code: str, language: str, filename: str) -> str:
+    """
+    Extract meaningful structure from code:
+    - imports/dependencies
+    - function/class names
+    - brief description of what each does
+    """
+    lines     = code.split("\n")
+    imports   = []
+    functions = []
+    classes   = []
+
+    for line in lines:
+        stripped = line.strip()
+        # Python imports
+        if language == "python":
+            if stripped.startswith(("import ", "from ")):
+                imports.append(stripped)
+            elif stripped.startswith("def "):
+                func_name = stripped.split("(")[0].replace("def ", "")
+                functions.append(func_name)
+            elif stripped.startswith("class "):
+                class_name = stripped.split("(")[0].split(":")[0].replace("class ", "")
+                classes.append(class_name)
+        # JavaScript/TypeScript
+        elif language in ("javascript", "typescript"):
+            if stripped.startswith(("import ", "require(")):
+                imports.append(stripped[:100])
+            elif "function " in stripped or "const " in stripped and "=>" in stripped:
+                functions.append(stripped[:80])
+        # Java
+        elif language == "java":
+            if stripped.startswith("import "):
+                imports.append(stripped)
+            elif "class " in stripped:
+                classes.append(stripped[:80])
+            elif stripped.startswith("public ") and "(" in stripped:
+                functions.append(stripped[:80])
+
+    summary = f"File: {filename}\nLanguage: {language}\n"
+    if imports:
+        summary += f"\nImports/Dependencies:\n" + "\n".join(imports[:20])
+    if classes:
+        summary += f"\nClasses: {', '.join(classes[:15])}"
+    if functions:
+        summary += f"\nFunctions: {', '.join(functions[:20])}"
+    summary += f"\n\nFull code:\n{code}"
+    return summary
+
+def parse_code_zip(file_bytes: bytes) -> list[dict]:
+    """
+    Extract and parse all code files from a ZIP archive.
+    Returns list of {filename, language, content, structure}
+    """
+    files = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            for zip_path in zf.namelist():
+                # Skip directories and hidden/system files
+                parts = zip_path.split("/")
+                if any(p in SKIP_DIRS for p in parts):
+                    continue
+                if os.path.basename(zip_path).startswith("."):
+                    continue
+                if zip_path.endswith("/"):
+                    continue
+
+                filename = os.path.basename(zip_path)
+                language = _get_file_language(filename)
+                if not language:
+                    continue  # skip non-code files
+
+                try:
+                    content = zf.read(zip_path).decode("utf-8", errors="ignore")
+                    if not content.strip():
+                        continue
+                    # Limit very large files
+                    if len(content) > 50000:
+                        content = content[:50000] + "\n... [truncated]"
+
+                    structure = _extract_code_structure(content, language, zip_path)
+                    files.append({
+                        "zip_path": zip_path,
+                        "filename": filename,
+                        "language": language,
+                        "content":  content,
+                        "structure": structure
+                    })
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"   ❌ ZIP parsing failed: {e}")
+
+    return files
+
+def parse_single_code_file(file_bytes: bytes, filename: str) -> list[dict]:
+    """Parse a single uploaded code file"""
+    language = _get_file_language(filename)
+    if not language:
+        return []
+    try:
+        content = file_bytes.decode("utf-8", errors="ignore")
+        if not content.strip():
+            return []
+        if len(content) > 50000:
+            content = content[:50000] + "\n... [truncated]"
+        structure = _extract_code_structure(content, language, filename)
+        return [{
+            "zip_path": filename,
+            "filename": filename,
+            "language": language,
+            "content":  content,
+            "structure": structure
+        }]
+    except Exception:
+        return []
+
 # ── Parsers ────────────────────────────────────────────────
 def parse_pdf(file_bytes: bytes) -> tuple[list[str], int]:
-    """Extract text from PDF pages"""
     doc   = fitz.open(stream=file_bytes, filetype="pdf")
     pages = [page.get_text() for page in doc]
     return pages, len(pages)
 
-def parse_pptx(file_bytes: bytes,
-               use_vision: bool = True) -> tuple[list[str], int]:
-    """
-    Parse PPTX with vision fallback for image-heavy slides.
+def parse_pptx(file_bytes: bytes, use_vision: bool = True) -> tuple[list[str], int]:
+    prs         = Presentation(io.BytesIO(file_bytes))
+    slides      = []
+    vision_ready = use_vision and _is_vision_available()
 
-    For each slide:
-    1. Extract text normally
-    2. If slide has images OR very little text → also run LLaVA
-    3. Combine text + vision description into rich content
-    """
-    prs          = Presentation(io.BytesIO(file_bytes))
-    slides       = []
-    llava_ready  = use_vision and _is_llava_available()
-
-    if use_vision and not llava_ready:
-        print("⚠️  LLaVA not found — falling back to text-only extraction.")
-        print("    To enable vision: ollama pull llava")
+    if use_vision and not vision_ready:
+        print("⚠️  Vision model not found — text-only extraction.")
 
     for slide_num, slide in enumerate(prs.slides, start=1):
-        # Step 1 — extract all text
         text_parts = []
         for shape in slide.shapes:
             if hasattr(shape, "text_frame"):
@@ -178,87 +290,53 @@ def parse_pptx(file_bytes: bytes,
                 text_parts.append(shape.text.strip())
 
         text_content = "\n".join(text_parts).strip()
-
-        # Step 2 — decide if vision is needed
-        needs_vision = (
-            llava_ready and (
-                _slide_has_images(slide) or
-                _slide_text_is_thin(slide)
-            )
+        needs_vision = vision_ready and (
+            _slide_has_images(slide) or _slide_text_is_thin(slide)
         )
 
         if needs_vision:
-            print(f"   🔍 Running vision on slide {slide_num}...")
-            slide_img    = _slide_to_pil_image(slide)
-            vision_desc  = _describe_image_with_llava(slide_img, slide_num)
-
-            # Combine: text + vision
-            if text_content:
-                combined = (
-                    f"{text_content}\n\n"
-                    f"[Visual content from slide {slide_num}]: {vision_desc}"
-                )
-            else:
-                combined = (
-                    f"[Slide {slide_num} — visual content]: {vision_desc}"
-                )
+            print(f"   🔍 Vision on slide {slide_num}...")
+            vision_desc = _describe_slide_image(_slide_to_pil_image(slide), slide_num)
+            combined = (
+                f"{text_content}\n\n[Visual content slide {slide_num}]: {vision_desc}"
+                if text_content else
+                f"[Slide {slide_num} visual]: {vision_desc}"
+            )
             slides.append(combined)
         else:
-            # Text-only
-            if text_content:
-                slides.append(text_content)
-            else:
-                slides.append(f"[Slide {slide_num} — no extractable content]")
+            slides.append(text_content or f"[Slide {slide_num} — no content]")
 
     return slides, len(slides)
 
-# ── Main ingestion ─────────────────────────────────────────
+# ── Main ingestion — PPT/PDF ───────────────────────────────
 def ingest_document(team_name: str, filename: str,
                     file_bytes: bytes) -> dict:
-    """
-    Full pipeline:
-    1. Register in SQLite  → status: pending
-    2. Parse file (text + vision if needed)
-    3. Update             → status: processing
-    4. Chunk + embed + store in ChromaDB
-    5. Update             → status: indexed / failed
-    """
-    file_type    = "pdf" if filename.lower().endswith(".pdf") else "pptx"
+    """Ingest PPT or PDF submission"""
+    ext          = filename.lower()
+    file_type    = "pdf" if ext.endswith(".pdf") else "pptx"
     file_size_kb = len(file_bytes) // 1024
 
-    # Step 1 — register in SQLite
     add_team(team_name)
-    doc_id = register_document(
-        team_name, filename, file_type, file_size_kb
-    )
+    doc_id = register_document(team_name, filename, file_type, file_size_kb)
 
     try:
-        # Step 2 — parse
         update_document_status(doc_id, "processing")
-        print(f"\n📄 Parsing {filename} for team '{team_name}'...")
+        print(f"\n📄 Parsing {filename} for '{team_name}'...")
 
         if file_type == "pdf":
             pages, total_pages = parse_pdf(file_bytes)
         else:
             pages, total_pages = parse_pptx(file_bytes, use_vision=True)
 
-        print(f"   ✅ Parsed {total_pages} slides/pages")
-
-        # Step 3 — chunk
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50
+            chunk_size=500, chunk_overlap=50
         )
-
-        all_chunks   = []
-        all_metadata = []
-        all_ids      = []
+        all_chunks, all_metadata, all_ids = [], [], []
 
         for page_num, page_text in enumerate(pages, start=1):
             if not page_text.strip():
                 continue
-            chunks = splitter.split_text(page_text)
-            for chunk_idx, chunk in enumerate(chunks):
+            for chunk_idx, chunk in enumerate(splitter.split_text(page_text)):
                 chunk_id = f"doc{doc_id}_p{page_num}_c{chunk_idx}"
                 all_chunks.append(chunk)
                 all_metadata.append({
@@ -267,58 +345,136 @@ def ingest_document(team_name: str, filename: str,
                     "filename":  filename,
                     "file_type": file_type,
                     "page":      page_num,
+                    "content_type": "presentation"
                 })
                 all_ids.append(chunk_id)
 
-        # Step 4 — store in ChromaDB in batches
         collection = get_collection()
         if all_chunks:
-            batch_size = 100
-            for i in range(0, len(all_chunks), batch_size):
+            for i in range(0, len(all_chunks), 100):
                 collection.add(
-                    documents=all_chunks[i:i+batch_size],
-                    metadatas=all_metadata[i:i+batch_size],
-                    ids=all_ids[i:i+batch_size]
+                    documents=all_chunks[i:i+100],
+                    metadatas=all_metadata[i:i+100],
+                    ids=all_ids[i:i+100]
                 )
 
-        print(f"   ✅ {len(all_chunks)} chunks stored in ChromaDB")
-
-        # Step 5 — mark indexed
         update_document_status(
             doc_id, "indexed",
             total_pages=total_pages,
             total_chunks=len(all_chunks)
         )
+        print(f"   ✅ {len(all_chunks)} chunks indexed")
+        return {"success": True, "doc_id": doc_id,
+                "total_pages": total_pages, "total_chunks": len(all_chunks)}
 
+    except Exception as e:
+        print(f"   ❌ {e}")
+        update_document_status(doc_id, "failed", error_message=str(e))
+        return {"success": False, "error": str(e)}
+
+# ── Main ingestion — Code ──────────────────────────────────
+def ingest_code(team_name: str, filename: str,
+                file_bytes: bytes) -> dict:
+    """
+    Ingest code — supports:
+    - ZIP file containing project
+    - Single code file (.py, .js, .java etc)
+    """
+    file_size_kb = len(file_bytes) // 1024
+    add_team(team_name)
+    doc_id = register_document(team_name, filename, "code", file_size_kb)
+
+    try:
+        update_document_status(doc_id, "processing")
+        print(f"\n💻 Parsing code: {filename} for '{team_name}'...")
+
+        # Determine if ZIP or single file
+        if filename.lower().endswith(".zip"):
+            code_files = parse_code_zip(file_bytes)
+        else:
+            code_files = parse_single_code_file(file_bytes, filename)
+
+        if not code_files:
+            raise ValueError("No supported code files found")
+
+        print(f"   📁 Found {len(code_files)} code files")
+
+        # Use smaller chunks for code to preserve function context
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=100
+        )
+
+        all_chunks, all_metadata, all_ids = [], [], []
+
+        for file_info in code_files:
+            chunks = splitter.split_text(file_info["structure"])
+            for chunk_idx, chunk in enumerate(chunks):
+                chunk_id = f"code{doc_id}_{file_info['filename']}_{chunk_idx}"
+                # Make chunk_id safe
+                chunk_id = re.sub(r"[^a-zA-Z0-9_-]", "_", chunk_id)
+                all_chunks.append(chunk)
+                all_metadata.append({
+                    "team":         team_name,
+                    "doc_id":       str(doc_id),
+                    "filename":     file_info["zip_path"],
+                    "file_type":    "code",
+                    "language":     file_info["language"],
+                    "page":         0,
+                    "content_type": "code"
+                })
+                all_ids.append(chunk_id)
+
+        collection = get_collection()
+        if all_chunks:
+            for i in range(0, len(all_chunks), 100):
+                collection.add(
+                    documents=all_chunks[i:i+100],
+                    metadatas=all_metadata[i:i+100],
+                    ids=all_ids[i:i+100]
+                )
+
+        update_document_status(
+            doc_id, "indexed",
+            total_pages=len(code_files),
+            total_chunks=len(all_chunks)
+        )
+        print(f"   ✅ {len(all_chunks)} code chunks indexed")
         return {
             "success":      True,
             "doc_id":       doc_id,
-            "total_pages":  total_pages,
-            "total_chunks": len(all_chunks)
+            "total_files":  len(code_files),
+            "total_chunks": len(all_chunks),
+            "languages":    list(set(f["language"] for f in code_files))
         }
 
     except Exception as e:
-        print(f"   ❌ Ingestion failed: {str(e)}")
-        update_document_status(
-            doc_id, "failed", error_message=str(e)
-        )
+        print(f"   ❌ {e}")
+        update_document_status(doc_id, "failed", error_message=str(e))
         return {"success": False, "error": str(e)}
 
 # ── Retrieval ──────────────────────────────────────────────
 def retrieve_context(query: str, team_name: str = None,
-                     n_results: int = 5) -> list[dict]:
+                     n_results: int = 5,
+                     content_type: str = None) -> list[dict]:
     """
-    Hybrid search: vector (ChromaDB) + keyword (BM25)
-    Returns list of {text, filename, page, team, score}
+    Hybrid search: Vector + BM25
+    content_type: "presentation", "code", or None (both)
     """
     collection = get_collection()
-    where      = {"team": team_name} if team_name else None
+
+    # Build where filter
+    where = {}
+    if team_name:
+        where["team"] = team_name
+    if content_type:
+        where["content_type"] = content_type
 
     try:
         results = collection.query(
             query_texts=[query],
             n_results=n_results,
-            where=where,
+            where=where if where else None,
             include=["documents", "metadatas", "distances"]
         )
     except Exception:
@@ -332,11 +488,13 @@ def retrieve_context(query: str, team_name: str = None,
             results["distances"][0]
         ):
             chunks.append({
-                "text":     doc,
-                "filename": meta.get("filename", ""),
-                "page":     meta.get("page", 0),
-                "team":     meta.get("team", ""),
-                "score":    round(1 - dist, 3)
+                "text":         doc,
+                "filename":     meta.get("filename", ""),
+                "page":         meta.get("page", 0),
+                "team":         meta.get("team", ""),
+                "language":     meta.get("language", ""),
+                "content_type": meta.get("content_type", ""),
+                "score":        round(1 - dist, 3)
             })
 
     # BM25 re-rank
@@ -347,9 +505,7 @@ def retrieve_context(query: str, team_name: str = None,
             bm25        = BM25Okapi(tokenised)
             bm25_scores = bm25.get_scores(query.lower().split())
             for i, c in enumerate(chunks):
-                c["score"] = round(
-                    c["score"] * 0.6 + bm25_scores[i] * 0.4, 3
-                )
+                c["score"] = round(c["score"] * 0.6 + bm25_scores[i] * 0.4, 3)
             chunks.sort(key=lambda x: x["score"], reverse=True)
         except Exception:
             pass
